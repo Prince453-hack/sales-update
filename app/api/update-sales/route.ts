@@ -253,8 +253,13 @@ function reconcileTableauVariance(
     // Variance: Tableau Net Sales - Brink Net Sales
     const variance = Math.round((tableauNet - bData.brinkNet) * 100) / 100;
 
-    // "check if any row have more than 1 value in variance net sales like in this there are 3
-    // so do it like from tablue data sheet minus that value from any data like in this case it has 6 row so minus from any where"
+    console.log(
+      `[Reconcile] Store: ${storeName}, TableauNet: ${tableauNet}, BrinkNet: ${bData.brinkNet}, Variance: ${variance}`
+    );
+
+    // If variance > 0 (Tableau has more net sales than Brink), deduct the difference
+    // from any Tableau Data row for that store so the variance becomes 0.
+    // Threshold > 1 to avoid floating-point noise.
     if (variance > 1) {
       let remaining = variance;
       // Sort rows by net descending to safely deduct from highest net sales days
@@ -909,6 +914,40 @@ async function cleanCalculationChain(zip: JSZip): Promise<void> {
 }
 
 // ----------------------------------------------------------------------
+// FORCE PIVOT TABLES TO REFRESH FROM SOURCE DATA ON FILE OPEN
+// Without this, the pivot cache has stale Net_Sales values and the
+// Summary sheet Column C (from PivotTable2) shows old numbers,
+// making Variance (Net Sales) non-zero even though we already
+// adjusted the Tableau Data sheet.
+// ----------------------------------------------------------------------
+async function enablePivotRefreshOnLoad(zip: JSZip): Promise<void> {
+  const allFiles = Object.keys(zip.files);
+  const pivotCacheFiles = allFiles.filter((f) =>
+    /xl\/pivotCache\/pivotCacheDefinition\d+\.xml$/.test(f)
+  );
+
+  for (const pcFile of pivotCacheFiles) {
+    const file = zip.file(pcFile);
+    if (!file) continue;
+    let xml = await file.async("text");
+
+    if (!xml.includes("refreshOnLoad")) {
+      // Insert refreshOnLoad="1" into the opening <pivotCacheDefinition> tag
+      xml = xml.replace(
+        "<pivotCacheDefinition ",
+        '<pivotCacheDefinition refreshOnLoad="1" '
+      );
+      console.log(`[Pivot] Added refreshOnLoad to ${pcFile}`);
+    } else {
+      // Ensure it is set to "1"
+      xml = xml.replace(/refreshOnLoad="[^"]*"/, 'refreshOnLoad="1"');
+    }
+
+    zip.file(pcFile, xml);
+  }
+}
+
+// ----------------------------------------------------------------------
 // MAIN API ROUTE HANDLER
 // ----------------------------------------------------------------------
 export async function POST(req: NextRequest) {
@@ -1091,6 +1130,10 @@ export async function POST(req: NextRequest) {
 
     // Clean calcChain to prevent calculation chain repair warnings
     await cleanCalculationChain(zip);
+
+    // Force pivot tables to refresh from source data when the file is opened.
+    // This ensures Summary sheet Column C reflects the adjusted Tableau Data values.
+    await enablePivotRefreshOnLoad(zip);
 
     // G. Generate final Excel buffer
     const outputBuffer = await zip.generateAsync({
