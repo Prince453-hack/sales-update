@@ -59,6 +59,36 @@ function formatDateValue(val: unknown): string {
   return String(val).trim();
 }
 
+function dateToExcelSerial(dateVal: unknown): number {
+  if (typeof dateVal === "number" && dateVal > 30000 && dateVal < 60000) {
+    return Math.round(dateVal);
+  }
+  const str = String(dateVal || "").trim();
+  const parts = str.split("/");
+  if (parts.length === 3) {
+    const m = parseInt(parts[0], 10) - 1;
+    const d = parseInt(parts[1], 10);
+    const y = parseInt(parts[2], 10);
+    const utcMs = Date.UTC(y, m, d);
+    return Math.round(utcMs / 86400000 + 25569);
+  }
+  const dt = new Date(str);
+  if (!isNaN(dt.getTime())) {
+    const utcMs = Date.UTC(dt.getFullYear(), dt.getMonth(), dt.getDate());
+    return Math.round(utcMs / 86400000 + 25569);
+  }
+  return 0;
+}
+
+function formatFilenameDate(serial: number): string {
+  if (serial <= 0) return "";
+  const date = new Date(Math.round((serial - 25569) * 86400 * 1000));
+  const m = date.getUTCMonth() + 1;
+  const d = String(date.getUTCDate()).padStart(2, "0");
+  const y = String(date.getUTCFullYear()).slice(-2);
+  return `${m}.${d}.${y}`;
+}
+
 function cleanLocationName(val: unknown): string {
   if (!val) return "";
   const str = String(val).trim();
@@ -416,9 +446,11 @@ function parseUploadedTableauBuffer(
 ): TableauRow[] {
   const tableauWb = XLSX.read(tableauBuffer, { type: "buffer" });
   const chosenSheetName =
-    tableauWb.SheetNames.find((name) =>
-      /tableau|sales.*summary|export|data/i.test(name)
-    ) || tableauWb.SheetNames[0];
+    tableauWb.SheetNames.find((name) => /tableau/i.test(name)) ||
+    tableauWb.SheetNames.find((name) => /data/i.test(name)) ||
+    tableauWb.SheetNames.find((name) => /export/i.test(name)) ||
+    tableauWb.SheetNames.find((name) => /sales/i.test(name)) ||
+    tableauWb.SheetNames[0];
 
   const rawRows: any[][] = XLSX.utils.sheet_to_json(
     tableauWb.Sheets[chosenSheetName],
@@ -1055,47 +1087,29 @@ export async function POST(req: NextRequest) {
       return false;
     };
 
-    // A. Process Brink file if provided
-    if (brinkFile) {
-      const buf = Buffer.from(await brinkFile.arrayBuffer());
-      const res = await processBrinkUpdate(zip, masterBuffer, buf, gcPromoMap);
-      updatedBrinkRows = res.rowsCount;
-      brinkStoreData = res.brinkStoreData;
-      updatedSheetsList.push(`Brink Sales Summary (#3: ${res.rowsCount} stores)`);
+    // Enforce both Brink and Tableau files in Step 1
+    if (!brinkFile || !tableauFile) {
+      return NextResponse.json(
+        {
+          error:
+            "Both Brink Sales Summary and Tableau Data files must be uploaded together.",
+        },
+        { status: 400 }
+      );
     }
 
-    // B. Process Tableau file if provided
-    if (tableauFile) {
-      const buf = Buffer.from(await tableauFile.arrayBuffer());
-      tableauRows = parseUploadedTableauBuffer(buf, locationToFranchisee);
-      updatedTableauRows = tableauRows.length;
-      updatedSheetsList.push(`Tableau Data (#6: ${tableauRows.length} records)`);
-    }
+    // A. Process Brink file
+    const brinkBuf = Buffer.from(await brinkFile.arrayBuffer());
+    const res = await processBrinkUpdate(zip, masterBuffer, brinkBuf, gcPromoMap);
+    updatedBrinkRows = res.rowsCount;
+    brinkStoreData = res.brinkStoreData;
+    updatedSheetsList.push(`Brink Sales Summary (#3: ${res.rowsCount} stores)`);
 
-    // C. Single generic file fallback
-    if (!brinkFile && !tableauFile && genericFile) {
-      const buf = Buffer.from(await genericFile.arrayBuffer());
-      const wb = XLSX.read(buf, { type: "buffer" });
-      const firstSheet = wb.Sheets[wb.SheetNames[0]];
-      const rawRows: any[][] = XLSX.utils.sheet_to_json(firstSheet, {
-        header: 1,
-      });
-
-      const isTab =
-        requestedTarget === "tableau" ||
-        (requestedTarget === "auto" && detectIsTableau(rawRows));
-
-      if (isTab) {
-        tableauRows = parseUploadedTableauBuffer(buf, locationToFranchisee);
-        updatedTableauRows = tableauRows.length;
-        updatedSheetsList.push(`Tableau Data (#6: ${tableauRows.length} records)`);
-      } else {
-        const res = await processBrinkUpdate(zip, masterBuffer, buf, gcPromoMap);
-        updatedBrinkRows = res.rowsCount;
-        brinkStoreData = res.brinkStoreData;
-        updatedSheetsList.push(`Brink Sales Summary (#3: ${res.rowsCount} stores)`);
-      }
-    }
+    // B. Process Tableau file
+    const tabBuf = Buffer.from(await tableauFile.arrayBuffer());
+    tableauRows = parseUploadedTableauBuffer(tabBuf, locationToFranchisee);
+    updatedTableauRows = tableauRows.length;
+    updatedSheetsList.push(`Tableau Data (#6: ${tableauRows.length} records)`);
 
     // Ensure we have both datasets available for reconciliation and summary update
     if (!brinkStoreData) {
@@ -1135,29 +1149,39 @@ export async function POST(req: NextRequest) {
     // This ensures Summary sheet Column C reflects the adjusted Tableau Data values.
     await enablePivotRefreshOnLoad(zip);
 
-    // G. Generate final Excel buffer
+    // G. Generate final Franchise Sales buffer
     const outputBuffer = await zip.generateAsync({
       type: "nodebuffer",
       compression: "DEFLATE",
     });
 
-    const downloadFileName = `Franchise Sales (Updated).xlsx`;
+    const salesFileName = `Franchise Sales (Updated).xlsx`;
     const summaryText = updatedSheetsList.join(" & ");
 
-    return new NextResponse(new Uint8Array(outputBuffer), {
-      status: 200,
-      headers: {
-        "Content-Type":
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "Content-Disposition": `attachment; filename="${downloadFileName}"`,
-        "X-Updated-Sheet": summaryText,
-        "X-Updated-Brink-Rows": String(updatedBrinkRows),
-        "X-Updated-Tableau-Rows": String(updatedTableauRows),
-        "X-Updated-Rows": String(updatedBrinkRows + updatedTableauRows),
-        "X-Reconciled-Stores": String(varianceResult.reconciledStoresCount),
-        "Access-Control-Expose-Headers":
-          "Content-Disposition, X-Updated-Sheet, X-Updated-Brink-Rows, X-Updated-Tableau-Rows, X-Updated-Rows, X-Reconciled-Stores",
+    let maxDateSerial = 0;
+    for (const row of tableauRows) {
+      const s = dateToExcelSerial(row.date);
+      if (s > maxDateSerial) maxDateSerial = s;
+    }
+    const latestDateStr = formatFilenameDate(maxDateSerial);
+
+    return NextResponse.json({
+      success: true,
+      stats: {
+        updatedSheet: summaryText,
+        brinkRows: updatedBrinkRows,
+        tableauRows: updatedTableauRows,
+        totalRows: updatedBrinkRows + updatedTableauRows,
+        reconciledStores: varianceResult.reconciledStoresCount,
+        latestDateStr,
       },
+      file: {
+        fileName: salesFileName,
+        data: Buffer.from(outputBuffer).toString("base64"),
+        mimeType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      },
+      tableauRows,
     });
   } catch (err) {
     console.error("Error updating sales files:", err);
