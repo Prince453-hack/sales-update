@@ -321,15 +321,123 @@ function reconcileTableauVariance(
 }
 
 // ----------------------------------------------------------------------
-// SAFELY UPDATE SUMMARY SHEET (CELLS C & L) ONLY FOR RECONCILED STORES
+// SAFELY UPDATE SUMMARY SHEET — helpers
 // ----------------------------------------------------------------------
+
+/** Convert a column letter (A, B, ..., Z, AA, ...) to a 1-based index. */
+function colLetterToIndex(col: string): number {
+  let n = 0;
+  for (const ch of col.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n;
+}
+
+/**
+ * Known default style indexes for columns in Summary (sheet2):
+ * A: 2 (string)
+ * B, C, M, N: 12 (number / currency)
+ * D, E, F, G, H, I, J: 4 (blue fill, number format #,##0)
+ * K, L: 11 (peach fill, number format #,##0)
+ */
+const DEFAULT_COLUMN_STYLES: Record<string, string> = {
+  A: "2",
+  B: "12",
+  C: "12",
+  D: "4",
+  E: "4",
+  F: "4",
+  G: "4",
+  H: "4",
+  I: "4",
+  J: "4",
+  K: "11",
+  L: "11",
+  M: "12",
+  N: "12",
+};
+
+/**
+ * Update a cell in a row XML fragment while STRICTLY PRESERVING:
+ * 1. Cell style attribute s="..." (fills, borders, fonts, number formats like #,##0)
+ * 2. Formula tags (<f>...</f> or shared formula tags like <f t="shared" .../>)
+ *
+ * If newFormula is provided, sets/updates <f> (e.g. adding safe IFERROR fallback to Col I).
+ * Otherwise preserves existing formula tag verbatim.
+ */
+function updateCellInRow(
+  rowXml: string,
+  cellRef: string,
+  value: number,
+  newFormula?: string
+): string {
+  const colLetter = cellRef.replace(/\d+/g, "");
+  const colIdx = colLetterToIndex(colLetter);
+  const defaultStyle = DEFAULT_COLUMN_STYLES[colLetter] || "4";
+
+  // Match existing cell: either <c r="X" ...>...</c> or self-closing <c r="X" .../>
+  const cellRegex = new RegExp(
+    `<c\\s+r="${cellRef}"([^>]*?)(?:\\/>|>([\\s\\S]*?)<\\/c>)`,
+    "i"
+  );
+  const match = rowXml.match(cellRegex);
+
+  if (match) {
+    const rawAttrs = match[1] || "";
+    const innerContent = match[2] || "";
+
+    // Keep all attributes (especially s="..."), remove t="..." since new value is numeric
+    let cleanAttrs = rawAttrs.replace(/\s+t="[^"]*"/g, "");
+
+    // Ensure s="..." is present
+    if (!/\bs="\d+"/.test(cleanAttrs)) {
+      cleanAttrs = ` s="${defaultStyle}"` + cleanAttrs;
+    }
+
+    // Determine formula
+    let formulaTag = "";
+    if (newFormula !== undefined) {
+      formulaTag = `<f>${newFormula}</f>`;
+    } else {
+      // Preserve existing <f...>...</f> or <f.../> tag
+      const fMatch = innerContent.match(/<f(?:\s+[^>]*)?(?:>[\s\S]*?<\/f>|\/>)/i);
+      if (fMatch) {
+        formulaTag = fMatch[0];
+      }
+    }
+
+    const replacementCell = `<c r="${cellRef}"${cleanAttrs}>${formulaTag}<v>${value}</v></c>`;
+    return rowXml.replace(match[0], replacementCell);
+  }
+
+  // Cell doesn't exist in the row – insert in sorted column order
+  const styleAttr = ` s="${defaultStyle}"`;
+  const formulaTag = newFormula ? `<f>${newFormula}</f>` : "";
+  const newCellXml = `<c r="${cellRef}"${styleAttr}>${formulaTag}<v>${value}</v></c>`;
+
+  const cellTagRe = /<c\s+r="([A-Z]+)\d+"(?:\s+[^>]*)?(?:\/>|>[\s\S]*?<\/c>)/gi;
+  let m: RegExpExecArray | null;
+  let insertIdx = -1;
+
+  while ((m = cellTagRe.exec(rowXml)) !== null) {
+    if (colLetterToIndex(m[1]) > colIdx) {
+      insertIdx = m.index;
+      break;
+    }
+  }
+
+  if (insertIdx !== -1) {
+    return rowXml.slice(0, insertIdx) + newCellXml + rowXml.slice(insertIdx);
+  }
+  return rowXml.replace("</row>", newCellXml + "</row>");
+}
+
 async function updateReconciledCellsInSummary(
   zip: JSZip,
   masterWb: XLSX.WorkBook,
-  reconciledStores: Map<string, { newTableauNet: number; variance: number }>
+  reconciledStores: Map<string, { newTableauNet: number; variance: number }>,
+  gcPromoMap: Map<string, number>,
+  brinkStoreData: Map<string, BrinkStoreData>,
+  lookupTableauToBrink: Map<string, string>
 ): Promise<void> {
-  if (reconciledStores.size === 0) return;
-
   const s2File = zip.file("xl/worksheets/sheet2.xml");
   if (!s2File) return;
 
@@ -345,38 +453,83 @@ async function updateReconciledCellsInSummary(
     const normClean = normalizeString(cleanStoreForMatching(storeName));
     const normRaw = normalizeString(cleanLocationName(storeName));
 
-    let match = reconciledStores.get(normClean) || reconciledStores.get(normRaw);
-    if (!match) {
+    // ── 1. Reconciled tableau net (col C) & variance (col L) ──────────────
+    let reconMatch = reconciledStores.get(normClean) || reconciledStores.get(normRaw);
+    if (!reconMatch) {
       for (const [rKey, rVal] of reconciledStores.entries()) {
         if (
           rKey === normClean ||
           rKey === normRaw ||
           (rKey.length >= 5 && (normClean.includes(rKey) || rKey.includes(normClean)))
         ) {
-          match = rVal;
+          reconMatch = rVal;
           break;
         }
       }
     }
 
-    if (match) {
-      const rowRegex = new RegExp(`(<row\\s+r="${r}"[\\s\\S]*?<\\/row>)`, "i");
-      const rowMatch = s2Xml.match(rowRegex);
-      if (rowMatch) {
-        let rowXml = rowMatch[1];
-        // Safely update cell C value to newTableauNet
-        rowXml = rowXml.replace(
-          new RegExp(`(<c\\s+r="C${r}"[^>]*>[\\s\\S]*?<v>)[^<]*(<\\/v>[\\s\\S]*?<\\/c>)`, "i"),
-          `$1${match.newTableauNet}$2`
-        );
-        // Safely update cell L (Variance Net) value to 0
-        rowXml = rowXml.replace(
-          new RegExp(`(<c\\s+r="L${r}"[^>]*>[\\s\\S]*?<v>)[^<]*(<\\/v>[\\s\\S]*?<\\/c>)`, "i"),
-          `$10$2`
-        );
-        s2Xml = s2Xml.replace(rowMatch[1], rowXml);
+    // ── 2. Look up GC Promo value for this store ───────────────────────────
+    let gcPromo = gcPromoMap.get(normClean) ?? gcPromoMap.get(normRaw) ?? 0;
+    if (gcPromo === 0) {
+      // Try alias via Lookup sheet
+      const alias = lookupTableauToBrink.get(normClean) || lookupTableauToBrink.get(normRaw);
+      if (alias) {
+        gcPromo = gcPromoMap.get(normalizeString(alias)) ?? 0;
       }
     }
+    if (gcPromo === 0) {
+      // Fuzzy search in gcPromoMap
+      for (const [k, v] of gcPromoMap.entries()) {
+        if (k.length >= 4 && (normClean.includes(k) || k.includes(normClean))) {
+          gcPromo = v;
+          break;
+        }
+      }
+    }
+
+    // ── 3. Look up Brink data for this store (for Net Sales computation) ───
+    const bData = findBrinkForStore(storeName, brinkStoreData, lookupTableauToBrink);
+
+    const rowRegex = new RegExp(`(<row\\s+r="${r}"(?:\\s[^>]*)?>)([\\s\\S]*?)(</row>)`, "i");
+    const rowMatch = s2Xml.match(rowRegex);
+    if (!rowMatch) continue;
+
+    let rowXml = rowMatch[0];
+
+    // ── 3a. Update Brink columns cached values while PRESERVING formulas & styles ──
+    // Formula E4: VLOOKUP(B:H, 7=GrossSales) - D4(Surcharges)
+    // Formula F4: VLOOKUP(B:N, 12=Refunds)
+    // Formula G4: VLOOKUP(B:N, 11=Surcharges)
+    // Formula H4: VLOOKUP(B:N, 13=Discounts)
+    if (bData) {
+      rowXml = updateCellInRow(rowXml, `E${r}`, Math.round(bData.brinkGross * 100) / 100);
+      rowXml = updateCellInRow(rowXml, `F${r}`, Math.round(bData.refunds * 100) / 100);
+      rowXml = updateCellInRow(rowXml, `G${r}`, Math.round(bData.surcharges * 100) / 100);
+      rowXml = updateCellInRow(rowXml, `H${r}`, Math.round(bData.discounts * 100) / 100);
+    }
+
+    // ── 3b. Update GC Promos (col I) with safe formula & calculated value ──
+    // Original template formula returns #N/A when store/alias is missing from GC Promo sheet.
+    // We add safe IFERROR(..., 0) fallback so it evaluates to 0 instead of #N/A.
+    const safeGcPromoFormula = `IFERROR(VLOOKUP(A${r},'GC Promo'!A:F,6,0),IFERROR(VLOOKUP(VLOOKUP(A${r},Lookup!A:B,2,0),'GC Promo'!A:F,6,0),0))`;
+    rowXml = updateCellInRow(rowXml, `I${r}`, gcPromo, safeGcPromoFormula);
+
+    // ── 3c. Update Net Sales (col J) cached value while PRESERVING formula & style ──
+    // Formula J4: =E4-F4-H4+I4-G4
+    if (bData) {
+      const netSales = Math.round(
+        (bData.brinkGross - bData.refunds - bData.discounts + gcPromo - bData.surcharges) * 100
+      ) / 100;
+      rowXml = updateCellInRow(rowXml, `J${r}`, netSales);
+    }
+
+    // ── 3d. Reconciled tableau net (col C) & variance (col L) ─────────────
+    if (reconMatch) {
+      rowXml = updateCellInRow(rowXml, `C${r}`, reconMatch.newTableauNet);
+      rowXml = updateCellInRow(rowXml, `L${r}`, 0);
+    }
+
+    s2Xml = s2Xml.replace(rowMatch[0], rowXml);
   }
 
   zip.file("xl/worksheets/sheet2.xml", s2Xml);
@@ -409,9 +562,9 @@ async function writeTableauRowsToZip(
   validTableauRows.forEach((row, idx) => {
     const rNum = 4 + idx;
     newRowsXml += `<row r="${rNum}" spans="1:8" x14ac:dyDescent="0.25">`;
-    newRowsXml += `<c r="A${rNum}" s="18" t="inlineStr"><is><t>${escapeXml(row.date)}</t></is></c>`;
+    newRowsXml += `<c r="A${rNum}" s="18" t="str"><v>${escapeXml(row.date)}</v></c>`;
     newRowsXml += `<c r="B${rNum}"><v>${row.modNo}</v></c>`;
-    newRowsXml += `<c r="C${rNum}" t="inlineStr"><is><t>${escapeXml(row.store)}</t></is></c>`;
+    newRowsXml += `<c r="C${rNum}" t="str"><v>${escapeXml(row.store)}</v></c>`;
     newRowsXml += `<c r="D${rNum}" s="46"><v>${row.gross}</v></c>`;
     newRowsXml += `<c r="E${rNum}" s="46"><v>${row.net}</v></c>`;
     newRowsXml += `<c r="F${rNum}" s="16" t="str"><f>VLOOKUP(Table1[[#This Row],[Store]],'Rates from Tracker'!A:I,3,0)</f><v>${escapeXml(row.franchisee)}</v></c>`;
@@ -830,14 +983,16 @@ async function processBrinkUpdate(
         } else if (uploadedRow[0] !== undefined) {
           locCode = String(uploadedRow[0]).trim();
         }
-        newRowsXml += `<c r="${cellRef}" t="inlineStr"><is><t>${escapeXml(locCode)}</t></is></c>`;
+        // Use t="str" (formula-string) so VLOOKUP in Summary sheet can match against this cell
+        newRowsXml += `<c r="${cellRef}" t="str"><v>${escapeXml(locCode)}</v></c>`;
       } else if (c === 1) {
         if (mapping) {
           locName = cleanLocationName(uploadedRow[mapping.uploadedCol]);
         } else if (uploadedRow[1] !== undefined) {
           locName = cleanLocationName(uploadedRow[1]);
         }
-        newRowsXml += `<c r="${cellRef}" t="inlineStr"><is><t>${escapeXml(locName)}</t></is></c>`;
+        // Use t="str" so VLOOKUP(A4,'Brink Sales Summary by Location'!B:H,...) can find the store name
+        newRowsXml += `<c r="${cellRef}" t="str"><v>${escapeXml(locName)}</v></c>`;
       } else if (c === 4 || c === 5 || c === 9) {
         newRowsXml += `<c r="${cellRef}"><v>0</v></c>`;
       } else {
@@ -881,7 +1036,7 @@ async function processBrinkUpdate(
 
   const totalRowNumber = 8 + validDataRows.length;
   newRowsXml += `<row r="${totalRowNumber}" ht="18" customHeight="1">`;
-  newRowsXml += `<c r="B${totalRowNumber}" t="inlineStr"><is><t>Total</t></is></c>`;
+  newRowsXml += `<c r="B${totalRowNumber}" t="str"><v>Total</v></c>`;
 
   for (let c = 2; c < totalTargetColumns; c++) {
     const colLetter = colIndexToLetter(c);
@@ -942,6 +1097,24 @@ async function cleanCalculationChain(zip: JSZip): Promise<void> {
       ""
     );
     zip.file("[Content_Types].xml", ctXml);
+  }
+
+  // 4. Force full calculation on load in xl/workbook.xml
+  const wbFile = zip.file("xl/workbook.xml");
+  if (wbFile) {
+    let wbXml = await wbFile.async("text");
+    if (wbXml.includes("<calcPr")) {
+      wbXml = wbXml.replace(/<calcPr\b([^>]*?)(?:\/>|>[\s\S]*?<\/calcPr>)/, (match, attrs) => {
+        let cleanAttrs = attrs.replace(/\s*\/$/, "").trim();
+        if (!cleanAttrs.includes("fullCalcOnLoad")) {
+          cleanAttrs += ' fullCalcOnLoad="1"';
+        } else {
+          cleanAttrs = cleanAttrs.replace(/fullCalcOnLoad="[^"]*"/, 'fullCalcOnLoad="1"');
+        }
+        return `<calcPr ${cleanAttrs}/>`;
+      });
+    }
+    zip.file("xl/workbook.xml", wbXml);
   }
 }
 
@@ -1135,11 +1308,18 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // E. Safely update Summary sheet (cells C and L) only for reconciled stores
+    // E. Update Summary sheet:
+    //    - Col C (Tableau Net Sales) for reconciled stores
+    //    - Col I (GC Promos) with direct values — bypasses broken VLOOKUP
+    //    - Col J (Net Sales) as computed number — bypasses #N/A cascade
+    //    - Col L (Variance Net Sales) = 0 for reconciled stores
     await updateReconciledCellsInSummary(
       zip,
       masterWb,
-      varianceResult.reconciledStores
+      varianceResult.reconciledStores,
+      gcPromoMap,
+      brinkStoreData,
+      lookupTableauToBrink
     );
 
     // Clean calcChain to prevent calculation chain repair warnings
