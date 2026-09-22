@@ -91,7 +91,19 @@ function formatFilenameDate(serial: number): string {
 
 function cleanLocationName(val: unknown): string {
   if (!val) return "";
-  const str = String(val).trim();
+  let str = String(val).trim();
+  // Normalize Norfork typo if present
+  str = str.replace(/\bnorfork\b/i, "Norfolk");
+  // Do not remove "-b" / "-B" for Norfolk (preserve "Norfolk-B")
+  if (/norfolk/i.test(str)) {
+    if (/\s*-\s*b$/i.test(str)) {
+      return str.replace(/\s*-\s*b$/i, "-B").trim();
+    }
+    if (/^norfolk$/i.test(str)) {
+      return "Norfolk-B";
+    }
+    return str;
+  }
   // Remove "-b", "-B", "-c", "-C", " - b", " - C" suffixes from location name
   return str.replace(/\s*-\s*[bc]$/i, "").trim();
 }
@@ -99,8 +111,13 @@ function cleanLocationName(val: unknown): string {
 function cleanStoreForMatching(val: unknown): string {
   if (!val) return "";
   let str = String(val).trim();
-  // Remove trailing branch suffixes like "-b", "-c"
-  str = str.replace(/\s*-\s*[bc]$/i, "").trim();
+  str = str.replace(/\bnorfork\b/i, "Norfolk");
+  // Remove trailing branch suffixes like "-b", "-c" (except Norfolk)
+  if (!/norfolk/i.test(str)) {
+    str = str.replace(/\s*-\s*[bc]$/i, "").trim();
+  } else if (/\s*-\s*b$/i.test(str)) {
+    str = str.replace(/\s*-\s*b$/i, "-B").trim();
+  }
   // Remove leading store / unit / MOD number prefixes (e.g. "231 Kennesaw", "231 - Kennesaw")
   // but protect street numbers like "26 & Van Dyke" or "104th & Federal"
   str = str.replace(/^(?:mod\s*#?\s*)?\d+\s*[-_–—:]\s*/i, "").trim();
